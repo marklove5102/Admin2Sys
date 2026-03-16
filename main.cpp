@@ -2,111 +2,192 @@
 #include <tlhelp32.h>
 #include <iostream>
 #include <string>
+#include <vector>
+
+#pragma comment(lib, "advapi32.lib")
 
 using namespace std;
 
-HANDLE getToken(DWORD pid) {
-    string userProcess;
-    HANDLE cToken = NULL;
-    HANDLE ph = NULL;
-    ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, true, pid);
-    if (ph == NULL) {
-        cToken = (HANDLE)NULL;
-    } else {
-        BOOL res = OpenProcessToken(ph, MAXIMUM_ALLOWED, &cToken);
-        if (!res) {
-            cToken = (HANDLE)NULL;
-        } else {
-        }
+// Enable SeDebugPrivilege for the current process
+BOOL EnableDebugPrivilege() {
+    HANDLE hToken = NULL;
+    TOKEN_PRIVILEGES tp = {};
+    LUID luid = {};
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+        return FALSE;
+
+    if (!LookupPrivilegeValueW(NULL, SE_DEBUG_NAME, &luid)) {
+        CloseHandle(hToken);
+        return FALSE;
     }
-    if (ph != NULL) {
-        CloseHandle(ph);
-    }
-    return cToken;
+
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    BOOL res = AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
+    CloseHandle(hToken);
+    return res && GetLastError() != ERROR_NOT_ALL_ASSIGNED;
 }
 
-BOOL createProcess(HANDLE token, LPCWSTR app) {
-    // initialize variables
-    HANDLE dToken = NULL;
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    BOOL res = TRUE;
-    ZeroMemory(&si, sizeof(STARTUPINFOW));
-    ZeroMemory(&pi, sizeof(PROCESS_INFORMATION));
+// Get token from a process by PID
+HANDLE GetProcessToken(DWORD pid) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcess)
+        return NULL;
+
+    HANDLE hToken = NULL;
+    if (!OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY, &hToken)) {
+        CloseHandle(hProcess);
+        return NULL;
+    }
+
+    CloseHandle(hProcess);
+    return hToken;
+}
+
+// Returns true if the token belongs to NT AUTHORITY\SYSTEM
+BOOL IsSystemToken(HANDLE hToken) {
+    DWORD dwSize = 0;
+    GetTokenInformation(hToken, TokenUser, NULL, 0, &dwSize);
+    if (dwSize == 0)
+        return FALSE;
+
+    PTOKEN_USER pTokenUser = (PTOKEN_USER)malloc(dwSize);
+    if (!pTokenUser)
+        return FALSE;
+
+    if (!GetTokenInformation(hToken, TokenUser, pTokenUser, dwSize, &dwSize)) {
+        free(pTokenUser);
+        return FALSE;
+    }
+
+    // Compare against the well-known SYSTEM SID (S-1-5-18)
+    PSID pSystemSid = NULL;
+    SID_IDENTIFIER_AUTHORITY NtAuthority = SECURITY_NT_AUTHORITY;
+    if (!AllocateAndInitializeSid(&NtAuthority, 1, SECURITY_LOCAL_SYSTEM_RID,
+        0, 0, 0, 0, 0, 0, 0, &pSystemSid)) {
+        free(pTokenUser);
+        return FALSE;
+    }
+
+    BOOL isSystem = EqualSid(pTokenUser->User.Sid, pSystemSid);
+
+    FreeSid(pSystemSid);
+    free(pTokenUser);
+    return isSystem;
+}
+
+// Spawn a process using a duplicated SYSTEM token
+BOOL SpawnProcessAsSystem(HANDLE hToken, LPCWSTR lpApp) {
+    HANDLE hDupToken = NULL;
+    STARTUPINFOW si = {};
+    PROCESS_INFORMATION pi = {};
     si.cb = sizeof(STARTUPINFOW);
 
-    res = DuplicateTokenEx(token, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &dToken);
-    res = CreateProcessWithTokenW(dToken, LOGON_WITH_PROFILE, app, NULL, 0, NULL, NULL, &si, &pi);
+    if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL,
+        SecurityImpersonation, TokenPrimary, &hDupToken)) {
+        return FALSE;
+    }
+
+    BOOL res = CreateProcessWithTokenW(
+        hDupToken,
+        LOGON_WITH_PROFILE,
+        lpApp,
+        NULL, 0, NULL, NULL,
+        &si, &pi
+    );
+
+    if (res) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+
+    CloseHandle(hDupToken);
     return res;
 }
 
-string GetProcessUserName(DWORD pid) {
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
-    if (!hProcess) return "";
-    HANDLE hToken = NULL;
-    if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
-        CloseHandle(hProcess);
-        return "";
+// Target process names known to run as SYSTEM and be accessible from admin
+const vector<wstring> TARGET_PROCESSES = {
+    L"winlogon.exe",
+    L"services.exe",
+    L"svchost.exe",
+    L"lsass.exe"
+};
+
+BOOL IsTargetProcess(LPCWSTR processName) {
+    for (const auto& target : TARGET_PROCESSES) {
+        if (_wcsicmp(processName, target.c_str()) == 0)
+            return TRUE;
     }
-    DWORD dwSize = 0;
-    GetTokenInformation(hToken, TokenUser, NULL, 0, &dwSize);
-    PTOKEN_USER pTokenUser = (PTOKEN_USER)malloc(dwSize);
-    SID_NAME_USE SidType;
-    char lpName[MAX_PATH];
-    DWORD dwNameSize = MAX_PATH;
-    char lpDomain[MAX_PATH];
-    DWORD dwDomainSize = MAX_PATH;
-    if (!LookupAccountSid(NULL, pTokenUser->User.Sid, lpName, &dwNameSize, lpDomain, &dwDomainSize, &SidType)) {
-        free(pTokenUser);
-        CloseHandle(hToken);
-        CloseHandle(hProcess);
-        return "";
-    }
-    string username(lpDomain);
-    username += "/";
-    username += lpName;
-    free(pTokenUser);
-    CloseHandle(hToken);
-    CloseHandle(hProcess);
-    return username;
+    return FALSE;
 }
 
+int wmain() {
+    if (!EnableDebugPrivilege()) {
+        wcerr << L"[!] Failed to enable SeDebugPrivilege. Run as admin.\n";
+        return 1;
+    }
+    wcout << L"[+] SeDebugPrivilege enabled.\n";
 
-int main(){
-    string username;
-    HANDLE hProcSnap;
-    PROCESSENTRY32 pe32;
-    string app;
-    string userProcess;
-    int pid = 0;
-                
-    hProcSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    pe32.dwSize = sizeof(PROCESSENTRY32); 
-    cout << "Enter the path of the application you want to run as SYSTEM: ";
-    cin >> app;
-    wstring wapp = wstring(app.begin(), app.end());
-    LPCWSTR LPCapp = wapp.c_str();    
-                
-    if(!Process32First(hProcSnap, &pe32)) {
-        CloseHandle(hProcSnap);
-        return 0;
+    wstring app;
+    wcout << L"[>] Enter path of application to run as SYSTEM: ";
+    wcin >> app;
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) {
+        wcerr << L"[!] CreateToolhelp32Snapshot failed.\n";
+        return 1;
     }
-                
-    while (Process32Next(hProcSnap, &pe32)) {
-        pid = pe32.th32ProcessID;
-        username = GetProcessUserName(pid);
-        if (username == "" || username == "NT AUTHORITY/SYSTEM") {
-            // get username of process
-            bool success = false;
-            HANDLE cToken = getToken(pid);
-            if (cToken != NULL || cToken == 0){
-                success = createProcess(cToken, LPCapp);
-                if(success){
-                    break;
-                }
-            }
+
+    PROCESSENTRY32W pe32 = {};
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+
+    if (!Process32FirstW(hSnap, &pe32)) {
+        CloseHandle(hSnap);
+        return 1;
+    }
+
+    BOOL spawned = FALSE;
+
+    do {
+        if (!IsTargetProcess(pe32.szExeFile))
+            continue;
+
+        DWORD pid = pe32.th32ProcessID;
+        wcout << L"[*] Trying: " << pe32.szExeFile << L" (PID " << pid << L")\n";
+
+        HANDLE hToken = GetProcessToken(pid);
+        if (!hToken) {
+            wcout << L"    [-] Could not open token.\n";
+            continue;
         }
-    }
-    CloseHandle(hProcSnap);   
-    return 0;    
+
+        if (!IsSystemToken(hToken)) {
+            wcout << L"    [-] Not a SYSTEM token, skipping.\n";
+            CloseHandle(hToken);
+            continue;
+        }
+
+        wcout << L"    [+] SYSTEM token acquired. Spawning process...\n";
+        spawned = SpawnProcessAsSystem(hToken, app.c_str());
+        CloseHandle(hToken);
+
+        if (spawned) {
+            wcout << L"[+] Process spawned successfully.\n";
+            break;
+        }
+        else {
+            wcout << L"    [-] CreateProcessWithTokenW failed: " << GetLastError() << L"\n";
+        }
+
+    } while (Process32NextW(hSnap, &pe32));
+
+    CloseHandle(hSnap);
+
+    if (!spawned)
+        wcerr << L"[!] Failed to spawn process as SYSTEM.\n";
+
+    return spawned ? 0 : 1;
 }
