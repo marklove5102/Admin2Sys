@@ -1,5 +1,5 @@
 # Admin2Sys
-Admin2Sys it's a C++ malware to escalate privileges from Administrator account to NT AUTHORITY SYSTEM. NT AUTHORITY SYSTEM it's the "user" account with most permisions in Windows OS
+A Windows token-theft utility that enumerates SYSTEM processes, duplicates their access token, and spawns a new process running as NT AUTHORITY\SYSTEM.
 
 # Usage
 Let's use and prove it:
@@ -23,14 +23,46 @@ And this is a popped CMD, now i execute the whoami command:
 ![image](https://user-images.githubusercontent.com/79543461/235516137-a3dcdc6a-da3d-4b86-9a84-a8a35202a8e5.png)
 
 # Code
-This code is a C++ program that attempts to run a specified application with SYSTEM-level privileges on a Windows system by finding a process running with SYSTEM-level privileges and then duplicating its access token to create a new process with the same privileges.
+**1. Enable debug privileges**
+The program first enables SeDebugPrivilege so it can open handles to protected SYSTEM processes.
 
-Here is a brief explanation of each function in the code:
+**2. Enumerate running processes**
+It creates a snapshot using:
 
-getToken: This function takes a process ID (pid) and returns a handle to the process's access token (cToken). It uses the OpenProcess function to open a handle to the process and then uses the OpenProcessToken function to get the process's access token.
+- CreateToolhelp32Snapshot
+- Process32First
+- Process32Next
 
-createProcess: This function takes a handle to an access token (token) and the path of an executable file (app) and creates a new process with the same privileges as the process associated with the access token. It uses the DuplicateTokenEx function to create a duplicate of the access token, and then uses the CreateProcessWithTokenW function to create the new process.
+to iterate through all running processes.
 
-GetProcessUserName: This function takes a process ID (pid) and returns the username associated with the process's access token. It uses the OpenProcess function to open a handle to the process, and then uses the OpenProcessToken function to get the process's access token. It then uses the GetTokenInformation function to get the user SID associated with the access token, and the LookupAccountSid function to convert the SID to a username.
+**3. Target known SYSTEM processes**
+It filters processes such as:
 
-main: This function is the entry point of the program. It first prompts the user to enter the path of the application they want to run as SYSTEM. It then loops through all the running processes on the system using the CreateToolhelp32Snapshot function and the Process32First and Process32Next functions. For each process, it checks the username associated with the process's access token using the GetProcessUserName function. If the username is blank or "NT AUTHORITY/SYSTEM", it tries to create a new process with the same privileges as the current process using the getToken and createProcess functions. If it is successful in creating the new process, the loop is exited and the program terminates.
+- winlogon.exe
+- services.exe
+- svchost.exe
+- lsass.exe
+
+which normally run as SYSTEM.
+
+**4. Steal the process token**
+For each candidate process:
+
+- OpenProcess() obtains a handle
+
+- OpenProcessToken() retrieves its security token
+
+**5. Verify the token belongs to SYSTEM**
+The token is checked with GetTokenInformation(TokenUser) and compared against the SYSTEM SID (S-1-5-18) using EqualSid.
+
+**6. Duplicate the token**
+If the token is valid:
+
+- DuplicateTokenEx() converts it into a primary token that can create new processes.
+
+**7. Spawn a SYSTEM process**
+Finally:
+
+- CreateProcessWithTokenW() launches the user-specified program (e.g., cmd.exe) using the duplicated SYSTEM token.
+
+The result is a new process running with SYSTEM privileges.
